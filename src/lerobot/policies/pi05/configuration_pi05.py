@@ -59,6 +59,13 @@ class PI05Config(PreTrainedConfig):
     # Real-Time Chunking (RTC) configuration
     rtc_config: RTCConfig | None = None
 
+    # Action robustness check: add noise to selected generated chunks during an episode.
+    action_robustness_noise_level: float = 0.0
+    action_robustness_chunk_indices: list[int] = field(default_factory=list)
+    action_robustness_noise_type: str = "gaussian"  # Options: "gaussian", "uniform", "constant"
+    action_robustness_noise_dims: list[int] | None = None
+    action_robustness_noise_seed: int | None = None
+
     image_resolution: tuple[int, int] = (
         DEFAULT_IMAGE_SIZE,
         DEFAULT_IMAGE_SIZE,
@@ -120,6 +127,14 @@ class PI05Config(PreTrainedConfig):
 
         if self.dtype not in ["bfloat16", "float32"]:
             raise ValueError(f"Invalid dtype: {self.dtype}")
+            
+        if self.action_robustness_noise_level < 0:
+            raise ValueError("action_robustness_noise_level must be non-negative")
+
+        if self.action_robustness_noise_type not in ["gaussian", "uniform", "constant"]:
+            raise ValueError(
+                "action_robustness_noise_type must be one of ['gaussian', 'uniform', 'constant']"
+            )
 
     def validate_features(self) -> None:
         """Validate and set up input/output features."""

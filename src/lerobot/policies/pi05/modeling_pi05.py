@@ -1129,6 +1129,8 @@ class PI05Policy(PreTrainedPolicy):
         self._queues = {
             ACTION: deque(maxlen=self.config.n_action_steps),
         }
+        self._action_robustness_generator = None
+        self._action_robustness_chunk_counter = 0
 
     def init_rtc_processor(self):
         """Initialize RTC processor if RTC is enabled in config."""
@@ -1211,6 +1213,82 @@ class PI05Policy(PreTrainedPolicy):
             img_masks.append(mask)
 
         return images, img_masks
+        
+    def _get_action_robustness_generator(self, device: torch.device) -> torch.Generator | None:
+        if self.config.action_robustness_noise_seed is None:
+            return None
+
+        generator = self._action_robustness_generator
+        if generator is None or getattr(generator, "device", None) != device:
+            generator = torch.Generator(device=device)
+            generator.manual_seed(self.config.action_robustness_noise_seed)
+            self._action_robustness_generator = generator
+        return generator
+
+    def _apply_action_robustness_noise(self, actions: Tensor, chunk_index: int) -> Tensor:
+        """Add test-time noise to a selected generated action chunk."""
+        noise_level = self.config.action_robustness_noise_level
+        if noise_level == 0 or not self.config.action_robustness_chunk_indices:
+            return actions
+
+        if chunk_index not in self.config.action_robustness_chunk_indices:
+            return actions
+
+        if self.config.action_robustness_noise_dims is None:
+            action_dims = list(range(actions.shape[-1]))
+        else:
+            action_dims = [
+                dim for dim in self.config.action_robustness_noise_dims if 0 <= dim < actions.shape[-1]
+            ]
+
+        if not action_dims:
+            return actions
+
+        perturbed_actions = actions.clone()
+        target = perturbed_actions[:, :, action_dims]
+
+        if self.config.action_robustness_noise_type == "constant":
+            noise = torch.full_like(target, noise_level)
+        else:
+            generator = self._get_action_robustness_generator(actions.device)
+            if self.config.action_robustness_noise_type == "gaussian":
+                noise = torch.randn(
+                    target.shape,
+                    dtype=target.dtype,
+                    device=target.device,
+                    generator=generator,
+                )
+                noise = noise * noise_level
+            elif self.config.action_robustness_noise_type == "uniform":
+                noise = torch.rand(
+                    target.shape,
+                    dtype=target.dtype,
+                    device=target.device,
+                    generator=generator,
+                )
+                noise = (noise * 2.0 - 1.0) * noise_level
+            else:
+                raise ValueError(
+                    f"Unsupported action_robustness_noise_type: {self.config.action_robustness_noise_type}"
+                )
+
+        perturbed_actions[:, :, action_dims] = target + noise
+        signal_rms = target.detach().float().pow(2).mean().sqrt()
+        noise_rms = noise.detach().float().pow(2).mean().sqrt()
+        eps = torch.finfo(signal_rms.dtype).eps
+        snr_db = 20.0 * torch.log10(signal_rms.clamp_min(eps) / noise_rms.clamp_min(eps))
+        print(
+            "[action_robustness] "
+            f"chunk={chunk_index} "
+            f"type={self.config.action_robustness_noise_type} "
+            f"level={noise_level:g} "
+            f"dims={action_dims} "
+            f"signal_rms={signal_rms.item():.6f} "
+            f"noise_rms={noise_rms.item():.6f} "
+            f"noise/signal={(noise_rms / signal_rms.clamp_min(eps)).item():.3f} "
+            f"snr_db={snr_db.item():.2f}"
+        )
+        return perturbed_actions
 
     def prepare_action(self, batch):
         """Pad action"""
@@ -1249,6 +1327,10 @@ class PI05Policy(PreTrainedPolicy):
         # Unpad actions to actual action dimension
         original_action_dim = self.config.output_features[ACTION].shape[0]
         actions = actions[:, :, :original_action_dim]
+        actions = self._apply_action_robustness_noise(
+            actions, chunk_index=self._action_robustness_chunk_counter
+        )
+        self._action_robustness_chunk_counter += 1
 
         return actions
 
