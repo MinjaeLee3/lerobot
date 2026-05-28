@@ -806,6 +806,11 @@ class PI05Pytorch(nn.Module):  # see openpi `PI0Pytorch`
         bsize = tokens.shape[0]
         device = tokens.device
 
+        start_event = torch.cuda.Event(enable_timing=True)
+        end_event = torch.cuda.Event(enable_timing=True)
+
+        start_event.record()
+
         if noise is None:
             # Sample noise with padded dimension as expected by action_in_proj
             actions_shape = (
@@ -865,7 +870,10 @@ class PI05Pytorch(nn.Module):  # see openpi `PI0Pytorch`
 
             if self.rtc_processor is not None and self.rtc_processor.is_debug_enabled():
                 self.rtc_processor.track(time=time, x_t=x_t, v_t=v_t)
-
+        end_event.record()
+        torch.cuda.synchronize()
+        elapsed_time_ms = start_event.elapsed_time(end_event)
+        logging.info(f"PI05 sample_actions inference time: {elapsed_time_ms:.2f} ms")
         return x_t
 
     def denoise_step(
