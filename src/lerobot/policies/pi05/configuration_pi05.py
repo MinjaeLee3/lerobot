@@ -65,6 +65,22 @@ class PI05Config(PreTrainedConfig):
     action_robustness_noise_type: str = "gaussian"  # Options: "gaussian", "uniform", "constant"
     action_robustness_noise_dims: list[int] | None = None
     action_robustness_noise_seed: int | None = None
+    # Step-window mode: perturb a sub-range of steps within every generated chunk.
+    # step_start is inclusive, step_end is exclusive. Overrides chunk_indices when set.
+    action_robustness_step_start: int | None = None
+    action_robustness_step_end: int | None = None
+    # Sim-step range mode: perturb actions whose absolute simulation time step falls in
+    # [sim_step_start, sim_step_end). Absolute sim step for action j in chunk i =
+    # i * n_action_steps + j. Takes priority over step-window and chunk-index modes.
+    action_robustness_sim_step_start: int | None = None
+    action_robustness_sim_step_end: int | None = None
+    # Exclude gripper dimension(s) from noise. When True, dims whose name contains "gripper"
+    # (from action_feature_names) are excluded; if action_feature_names is None, the last
+    # dimension of the action space is excluded as the conventional gripper dim.
+    action_robustness_exclude_gripper: bool = False
+    # Path to a JSONL file for per-step action logging. Each line records obs state,
+    # raw (pre-perturbation) and executed (post-perturbation) action values.
+    action_robustness_log_path: str | None = None
 
     image_resolution: tuple[int, int] = (
         DEFAULT_IMAGE_SIZE,

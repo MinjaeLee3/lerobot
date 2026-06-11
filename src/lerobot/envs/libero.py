@@ -362,12 +362,14 @@ class LiberoEnv(gym.Env):
         raw_obs, reward, done, info = self._env.step(action)
 
         is_success = self._env.check_success()
-        terminated = done or is_success
+        inner_env = getattr(self._env, "env", None)
+        robosuite_done = bool(getattr(inner_env, "done", False))
+        terminated = done or robosuite_done or is_success
         info.update(
             {
                 "task": self.task,
                 "task_id": self.task_id,
-                "done": done,
+                "done": done or robosuite_done,
                 "is_success": is_success,
             }
         )
@@ -376,6 +378,52 @@ class LiberoEnv(gym.Env):
             self.reset()
         truncated = False
         return observation, reward, terminated, truncated, info
+
+    def save_sim_state(self) -> dict:
+        """Save mid-episode simulation state for branched evaluation.
+
+        Returns a snapshot dict that can be passed to restore_sim_state().
+        Captures MuJoCo physics state and robot controller goals.
+        """
+        assert self._env is not None, "save_sim_state called before env is initialized"
+        sim = self._env.sim
+        mj_state = sim.get_state()
+        robot_states = []
+        for robot in self._env.robots:
+            ctrl = robot.controller
+            rs = {
+                "goal_pos": ctrl.goal_pos.copy() if hasattr(ctrl, "goal_pos") and ctrl.goal_pos is not None else None,
+                "goal_ori": ctrl.goal_ori.copy() if hasattr(ctrl, "goal_ori") and ctrl.goal_ori is not None else None,
+            }
+            robot_states.append(rs)
+        return {"mj_state": mj_state, "robot_states": robot_states}
+
+    def restore_sim_state(self, snap: dict):
+        """Restore simulation state from a snapshot and return the current observation.
+
+        After restoring, re-collects observation from the restored physics state so
+        the caller can use it directly without a separate obs fetch.
+        """
+        assert self._env is not None, "restore_sim_state called before env is initialized"
+        sim = self._env.sim
+        sim.set_state(snap["mj_state"])
+        sim.forward()
+        # Reset robosuite's termination flag. sim.set_state/forward restores physics
+        # but not the robosuite-level `done` flag set when an episode terminates.
+        # Without this, the next env.step() raises "executing action in terminated episode".
+        env_obj = self._env
+        while env_obj is not None:
+            if hasattr(env_obj, "done"):
+                env_obj.done = False
+            env_obj = getattr(env_obj, "env", None)
+        for robot, rs in zip(self._env.robots, snap["robot_states"]):
+            ctrl = robot.controller
+            if rs["goal_pos"] is not None and hasattr(ctrl, "goal_pos"):
+                ctrl.goal_pos = rs["goal_pos"].copy()
+            if rs["goal_ori"] is not None and hasattr(ctrl, "goal_ori"):
+                ctrl.goal_ori = rs["goal_ori"].copy()
+        raw_obs = self._env.env._get_observations()
+        return self._format_raw_obs(raw_obs)
 
     def close(self):
         if self._env is not None:

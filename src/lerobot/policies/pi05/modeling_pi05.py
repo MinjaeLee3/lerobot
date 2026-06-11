@@ -15,6 +15,7 @@
 # limitations under the License.
 
 import builtins
+import copy
 import logging
 import math
 from collections import deque
@@ -872,8 +873,13 @@ class PI05Pytorch(nn.Module):  # see openpi `PI0Pytorch`
                 self.rtc_processor.track(time=time, x_t=x_t, v_t=v_t)
         end_event.record()
         torch.cuda.synchronize()
-        elapsed_time_ms = start_event.elapsed_time(end_event)
-        logging.info(f"PI05 sample_actions inference time: {elapsed_time_ms:.2f} ms")
+        try:
+            elapsed_time_ms = start_event.elapsed_time(end_event)
+            logging.info(f"PI05 sample_actions inference time: {elapsed_time_ms:.2f} ms")
+        except ValueError:
+            # torch.compile may not record CUDA events during JIT warm-up tracing;
+            # skip timing rather than crashing.
+            pass
         return x_t
 
     def denoise_step(
@@ -1139,6 +1145,71 @@ class PI05Policy(PreTrainedPolicy):
         }
         self._action_robustness_generator = None
         self._action_robustness_chunk_counter = 0
+        self._action_log_step = 0
+        # Buffer: (raw_chunk, perturbed_chunk) per chunk, consumed in select_action
+        self._action_log_chunk_buf: tuple | None = None
+
+    def _clone_runtime_state_value(self, value):
+        """Clone tensors in policy runtime snapshots to avoid branch aliasing."""
+        if isinstance(value, Tensor):
+            return value.detach().clone()
+        if isinstance(value, tuple):
+            return tuple(self._clone_runtime_state_value(v) for v in value)
+        if isinstance(value, list):
+            return [self._clone_runtime_state_value(v) for v in value]
+        if isinstance(value, dict):
+            return {k: self._clone_runtime_state_value(v) for k, v in value.items()}
+        return copy.deepcopy(value)
+
+    def snapshot(self) -> dict:
+        """Capture all runtime state for mid-episode forking (branched eval).
+
+        Saves action queue, chunk counter, log state, and global torch RNG so
+        that all branches restored from this snapshot will use the same initial
+        flow-matching noise on their first post-branch inference call.
+        """
+        rng_state = torch.get_rng_state()
+        cuda_rng_state = torch.cuda.get_rng_state() if torch.cuda.is_available() else None
+        gen_state = None
+        if self._action_robustness_generator is not None:
+            gen_state = self._action_robustness_generator.get_state()
+        action_queue = self._clone_runtime_state_value(list(self._action_queue))
+        return {
+            "action_queue": action_queue,
+            "chunk_counter": self._action_robustness_chunk_counter,
+            "log_step": self._action_log_step,
+            "log_chunk_buf": self._clone_runtime_state_value(self._action_log_chunk_buf),
+            "torch_rng_state": rng_state,
+            "cuda_rng_state": cuda_rng_state,
+            "gen_state": gen_state,
+        }
+
+    def restore(self, snap: dict) -> None:
+        """Restore runtime state from a snapshot produced by snapshot().
+
+        Restores global torch RNG so the next flow-matching call uses the same
+        initial noise as every other branch restored from the same snapshot.
+        """
+        action_queue = self._clone_runtime_state_value(snap["action_queue"])
+        self._action_queue = deque(action_queue, maxlen=self.config.n_action_steps)
+        self._queues = {
+            ACTION: deque(
+                self._clone_runtime_state_value(snap["action_queue"]),
+                maxlen=self.config.n_action_steps,
+            )
+        }
+        self._action_robustness_chunk_counter = snap["chunk_counter"]
+        self._action_log_step = snap["log_step"]
+        self._action_log_chunk_buf = self._clone_runtime_state_value(snap["log_chunk_buf"])
+        torch.set_rng_state(snap["torch_rng_state"])
+        if snap["cuda_rng_state"] is not None:
+            torch.cuda.set_rng_state(snap["cuda_rng_state"])
+        self._action_robustness_generator = None
+        if snap["gen_state"] is not None:
+            device = next(self.parameters()).device
+            gen = torch.Generator(device=device)
+            gen.set_state(snap["gen_state"])
+            self._action_robustness_generator = gen
 
     def init_rtc_processor(self):
         """Initialize RTC processor if RTC is enabled in config."""
@@ -1234,13 +1305,50 @@ class PI05Policy(PreTrainedPolicy):
         return generator
 
     def _apply_action_robustness_noise(self, actions: Tensor, chunk_index: int) -> Tensor:
-        """Add test-time noise to a selected generated action chunk."""
+        """Add test-time noise to a selected generated action chunk.
+
+        Three modes checked in priority order:
+        - Sim-step range mode (sim_step_start/sim_step_end set): perturb actions whose
+          absolute simulation step i*n_action_steps+j falls in [sim_step_start, sim_step_end).
+        - Step-window mode (step_start/step_end set): perturb steps [step_start, step_end)
+          within every chunk, ignoring chunk_indices.
+        - Chunk-index mode (default): perturb all steps of selected chunk indices.
+        """
         noise_level = self.config.action_robustness_noise_level
-        if noise_level == 0 or not self.config.action_robustness_chunk_indices:
+        if noise_level == 0:
             return actions
 
-        if chunk_index not in self.config.action_robustness_chunk_indices:
-            return actions
+        n_steps = actions.shape[1]
+
+        sim_step_start = self.config.action_robustness_sim_step_start
+        sim_step_end = self.config.action_robustness_sim_step_end
+        step_start = self.config.action_robustness_step_start
+        step_end = self.config.action_robustness_step_end
+
+        if sim_step_start is not None or sim_step_end is not None:
+            chunk_sim_start = chunk_index * n_steps
+            s = max(0, (sim_step_start if sim_step_start is not None else 0) - chunk_sim_start)
+            e = min(n_steps, (sim_step_end if sim_step_end is not None else chunk_sim_start + n_steps) - chunk_sim_start)
+            if s >= e:
+                return actions
+            step_slice = slice(s, e)
+            abs_s = chunk_sim_start + s
+            abs_e = chunk_sim_start + e
+            mode_label = f"sim_steps={abs_s}-{abs_e - 1}(chunk={chunk_index},local={s}-{e - 1})"
+        elif step_start is not None or step_end is not None:
+            s = max(0, step_start if step_start is not None else 0)
+            e = min(n_steps, step_end if step_end is not None else n_steps)
+            if s >= e:
+                return actions
+            step_slice = slice(s, e)
+            mode_label = f"steps={s}-{e - 1}(chunk={chunk_index})"
+        else:
+            if not self.config.action_robustness_chunk_indices:
+                return actions
+            if chunk_index not in self.config.action_robustness_chunk_indices:
+                return actions
+            step_slice = slice(None)
+            mode_label = f"chunk={chunk_index}"
 
         if self.config.action_robustness_noise_dims is None:
             action_dims = list(range(actions.shape[-1]))
@@ -1249,11 +1357,15 @@ class PI05Policy(PreTrainedPolicy):
                 dim for dim in self.config.action_robustness_noise_dims if 0 <= dim < actions.shape[-1]
             ]
 
+        if self.config.action_robustness_exclude_gripper:
+            gripper_dims = self._get_gripper_dims(actions.shape[-1])
+            action_dims = [d for d in action_dims if d not in gripper_dims]
+
         if not action_dims:
             return actions
 
         perturbed_actions = actions.clone()
-        target = perturbed_actions[:, :, action_dims]
+        target = perturbed_actions[:, step_slice, :][:, :, action_dims]
 
         if self.config.action_robustness_noise_type == "constant":
             noise = torch.full_like(target, noise_level)
@@ -1265,29 +1377,28 @@ class PI05Policy(PreTrainedPolicy):
                     dtype=target.dtype,
                     device=target.device,
                     generator=generator,
-                )
-                noise = noise * noise_level
+                ) * noise_level
             elif self.config.action_robustness_noise_type == "uniform":
-                noise = torch.rand(
+                noise = (torch.rand(
                     target.shape,
                     dtype=target.dtype,
                     device=target.device,
                     generator=generator,
-                )
-                noise = (noise * 2.0 - 1.0) * noise_level
+                ) * 2.0 - 1.0) * noise_level
             else:
                 raise ValueError(
                     f"Unsupported action_robustness_noise_type: {self.config.action_robustness_noise_type}"
                 )
 
-        perturbed_actions[:, :, action_dims] = target + noise
+        perturbed_actions[:, step_slice, :][:, :, action_dims] = target + noise
+
         signal_rms = target.detach().float().pow(2).mean().sqrt()
         noise_rms = noise.detach().float().pow(2).mean().sqrt()
         eps = torch.finfo(signal_rms.dtype).eps
         snr_db = 20.0 * torch.log10(signal_rms.clamp_min(eps) / noise_rms.clamp_min(eps))
         print(
             "[action_robustness] "
-            f"chunk={chunk_index} "
+            f"{mode_label} "
             f"type={self.config.action_robustness_noise_type} "
             f"level={noise_level:g} "
             f"dims={action_dims} "
@@ -1297,6 +1408,53 @@ class PI05Policy(PreTrainedPolicy):
             f"snr_db={snr_db.item():.2f}"
         )
         return perturbed_actions
+
+    def _get_gripper_dims(self, n_action_dims: int) -> list[int]:
+        """Return action dimension indices corresponding to the gripper."""
+        feature_names = self.config.action_feature_names
+        if feature_names:
+            return [i for i, name in enumerate(feature_names) if "gripper" in name.lower() and i < n_action_dims]
+        # Fallback: last dimension of the actual (unpadded) action space
+        actual_dim = self.config.output_features[ACTION].shape[0]
+        return [actual_dim - 1] if actual_dim > 0 else []
+
+    def _action_log_write_step(self, batch: dict[str, Tensor], action: Tensor) -> None:
+        """Append a per-step record to the action log JSONL file."""
+        if self.config.action_robustness_log_path is None:
+            return
+        import json as _json
+
+        step = self._action_log_step
+        self._action_log_step += 1
+
+        # Derive step-within-chunk from chunk buffer
+        chunk_idx = self._action_robustness_chunk_counter - 1
+        n = self.config.n_action_steps
+        step_in_chunk = (n - 1 - len(self._action_queue)) % n
+
+        raw_action_val: list | None = None
+        if self._action_log_chunk_buf is not None:
+            raw_chunk, _ = self._action_log_chunk_buf
+            # raw_chunk: (batch, n_action_steps, action_dim) — take first env
+            if step_in_chunk < raw_chunk.shape[1]:
+                raw_action_val = raw_chunk[0, step_in_chunk].tolist()
+
+        obs_state: list | None = None
+        from lerobot.utils.constants import OBS_STATE
+        if OBS_STATE in batch:
+            s = batch[OBS_STATE]
+            obs_state = s[0].detach().cpu().tolist() if s is not None else None
+
+        record = {
+            "global_step": step,
+            "chunk_index": chunk_idx,
+            "step_in_chunk": step_in_chunk,
+            "obs_state": obs_state,
+            "raw_action": raw_action_val,
+            "action": action[0].detach().cpu().tolist(),
+        }
+        with open(self.config.action_robustness_log_path, "a") as fh:
+            fh.write(_json.dumps(record) + "\n")
 
     def prepare_action(self, batch):
         """Pad action"""
@@ -1318,7 +1476,9 @@ class PI05Policy(PreTrainedPolicy):
             # Transpose to get shape (n_action_steps, batch_size, action_dim)
             self._action_queue.extend(actions.transpose(0, 1))
 
-        return self._action_queue.popleft()
+        action = self._action_queue.popleft()
+        self._action_log_write_step(batch, action)
+        return action
 
     @torch.no_grad()
     def predict_action_chunk(self, batch: dict[str, Tensor], **kwargs: Unpack[ActionSelectKwargs]) -> Tensor:
@@ -1335,8 +1495,13 @@ class PI05Policy(PreTrainedPolicy):
         # Unpad actions to actual action dimension
         original_action_dim = self.config.output_features[ACTION].shape[0]
         actions = actions[:, :, :original_action_dim]
+        raw_actions = actions
         actions = self._apply_action_robustness_noise(
             actions, chunk_index=self._action_robustness_chunk_counter
+        )
+        self._action_log_chunk_buf = (
+            raw_actions[:, : self.config.n_action_steps].detach().cpu(),
+            actions[:, : self.config.n_action_steps].detach().cpu(),
         )
         self._action_robustness_chunk_counter += 1
 
