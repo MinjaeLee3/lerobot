@@ -396,7 +396,8 @@ class LiberoEnv(gym.Env):
                 "goal_ori": ctrl.goal_ori.copy() if hasattr(ctrl, "goal_ori") and ctrl.goal_ori is not None else None,
             }
             robot_states.append(rs)
-        return {"mj_state": mj_state, "robot_states": robot_states}
+        timestep = getattr(self._env, "timestep", 0)
+        return {"mj_state": mj_state, "robot_states": robot_states, "timestep": timestep}
 
     def restore_sim_state(self, snap: dict):
         """Restore simulation state from a snapshot and return the current observation.
@@ -408,13 +409,17 @@ class LiberoEnv(gym.Env):
         sim = self._env.sim
         sim.set_state(snap["mj_state"])
         sim.forward()
-        # Reset robosuite's termination flag. sim.set_state/forward restores physics
-        # but not the robosuite-level `done` flag set when an episode terminates.
-        # Without this, the next env.step() raises "executing action in terminated episode".
+        # Reset robosuite's termination flag and timestep counter. sim.set_state/forward
+        # restores physics but not the robosuite-level `done` flag or `timestep`. Without
+        # resetting these, `done` raises "executing action in terminated episode", and
+        # accumulated `timestep` causes premature horizon-based termination of later branches.
+        saved_timestep = snap.get("timestep", 0)
         env_obj = self._env
         while env_obj is not None:
             if hasattr(env_obj, "done"):
                 env_obj.done = False
+            if hasattr(env_obj, "timestep"):
+                env_obj.timestep = saved_timestep
             env_obj = getattr(env_obj, "env", None)
         for robot, rs in zip(self._env.robots, snap["robot_states"]):
             ctrl = robot.controller

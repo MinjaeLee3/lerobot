@@ -1145,9 +1145,12 @@ class PI05Policy(PreTrainedPolicy):
         }
         self._action_robustness_generator = None
         self._action_robustness_chunk_counter = 0
+        self._sim_step = 0
         self._action_log_step = 0
         # Buffer: (raw_chunk, perturbed_chunk) per chunk, consumed in select_action
         self._action_log_chunk_buf: tuple | None = None
+        # In-memory log buffer for Phase 1 (shared trajectory sweep)
+        self._action_log_memory: list | None = None
 
     def _clone_runtime_state_value(self, value):
         """Clone tensors in policy runtime snapshots to avoid branch aliasing."""
@@ -1177,6 +1180,7 @@ class PI05Policy(PreTrainedPolicy):
         return {
             "action_queue": action_queue,
             "chunk_counter": self._action_robustness_chunk_counter,
+            "sim_step": self._sim_step,
             "log_step": self._action_log_step,
             "log_chunk_buf": self._clone_runtime_state_value(self._action_log_chunk_buf),
             "torch_rng_state": rng_state,
@@ -1199,6 +1203,7 @@ class PI05Policy(PreTrainedPolicy):
             )
         }
         self._action_robustness_chunk_counter = snap["chunk_counter"]
+        self._sim_step = snap.get("sim_step", 0)
         self._action_log_step = snap["log_step"]
         self._action_log_chunk_buf = self._clone_runtime_state_value(snap["log_chunk_buf"])
         torch.set_rng_state(snap["torch_rng_state"])
@@ -1210,6 +1215,41 @@ class PI05Policy(PreTrainedPolicy):
             gen = torch.Generator(device=device)
             gen.set_state(snap["gen_state"])
             self._action_robustness_generator = gen
+
+    def flush_queued_noise(self) -> None:
+        """Retroactively apply noise to pre-queued actions within the current noise window.
+
+        Must be called after policy.restore() + spec.apply_to_config() when the
+        branch point is mid-chunk (i.e., the queue is non-empty from Phase 1 actions
+        that were generated without noise).  Only operates in sim-step range mode;
+        other modes are unaffected by mid-chunk branch points.
+
+        The queued actions cover absolute sim steps [_sim_step, _sim_step+n).
+        We re-process them through _apply_action_robustness_noise using _sim_step
+        as chunk_sim_start so the [sim_step_start, sim_step_end) window is applied
+        correctly.
+        """
+        if not self._action_queue:
+            return
+        if self.config.action_robustness_noise_level == 0:
+            return
+        # Only sim-step mode is affected by mid-chunk branch points.
+        if (self.config.action_robustness_sim_step_start is None
+                and self.config.action_robustness_sim_step_end is None):
+            return
+
+        n = len(self._action_queue)
+        # Each queue entry: (batch, action_dim) → stack to (batch, n, action_dim)
+        stacked = torch.stack(list(self._action_queue), dim=1)
+        stacked = self._apply_action_robustness_noise(
+            stacked,
+            chunk_index=self._action_robustness_chunk_counter,
+            chunk_sim_start=self._sim_step,
+        )
+        new_queue: deque = deque(maxlen=self._action_queue.maxlen)
+        for i in range(n):
+            new_queue.append(stacked[:, i, :])
+        self._action_queue = new_queue
 
     def init_rtc_processor(self):
         """Initialize RTC processor if RTC is enabled in config."""
@@ -1304,7 +1344,13 @@ class PI05Policy(PreTrainedPolicy):
             self._action_robustness_generator = generator
         return generator
 
-    def _apply_action_robustness_noise(self, actions: Tensor, chunk_index: int) -> Tensor:
+    def _apply_action_robustness_noise(
+        self,
+        actions: Tensor,
+        chunk_index: int,
+        *,
+        chunk_sim_start: int | None = None,
+    ) -> Tensor:
         """Add test-time noise to a selected generated action chunk.
 
         Three modes checked in priority order:
@@ -1326,7 +1372,8 @@ class PI05Policy(PreTrainedPolicy):
         step_end = self.config.action_robustness_step_end
 
         if sim_step_start is not None or sim_step_end is not None:
-            chunk_sim_start = chunk_index * n_steps
+            if chunk_sim_start is None:
+                chunk_sim_start = chunk_index * n_steps
             s = max(0, (sim_step_start if sim_step_start is not None else 0) - chunk_sim_start)
             e = min(n_steps, (sim_step_end if sim_step_end is not None else chunk_sim_start + n_steps) - chunk_sim_start)
             if s >= e:
@@ -1419,13 +1466,16 @@ class PI05Policy(PreTrainedPolicy):
         return [actual_dim - 1] if actual_dim > 0 else []
 
     def _action_log_write_step(self, batch: dict[str, Tensor], action: Tensor) -> None:
-        """Append a per-step record to the action log JSONL file."""
-        if self.config.action_robustness_log_path is None:
-            return
-        import json as _json
+        """Append a per-step record to the action log JSONL file and/or in-memory buffer."""
+        log_path = self.config.action_robustness_log_path
+        memory = self._action_log_memory
 
         step = self._action_log_step
-        self._action_log_step += 1
+        self._action_log_step += 1  # always increment regardless of logging target
+
+        if log_path is None and memory is None:
+            return
+        import json as _json
 
         # Derive step-within-chunk from chunk buffer
         chunk_idx = self._action_robustness_chunk_counter - 1
@@ -1435,7 +1485,6 @@ class PI05Policy(PreTrainedPolicy):
         raw_action_val: list | None = None
         if self._action_log_chunk_buf is not None:
             raw_chunk, _ = self._action_log_chunk_buf
-            # raw_chunk: (batch, n_action_steps, action_dim) — take first env
             if step_in_chunk < raw_chunk.shape[1]:
                 raw_action_val = raw_chunk[0, step_in_chunk].tolist()
 
@@ -1453,8 +1502,11 @@ class PI05Policy(PreTrainedPolicy):
             "raw_action": raw_action_val,
             "action": action[0].detach().cpu().tolist(),
         }
-        with open(self.config.action_robustness_log_path, "a") as fh:
-            fh.write(_json.dumps(record) + "\n")
+        if memory is not None:
+            memory.append(record)
+        if log_path is not None:
+            with open(log_path, "a") as fh:
+                fh.write(_json.dumps(record) + "\n")
 
     def prepare_action(self, batch):
         """Pad action"""
@@ -1477,6 +1529,7 @@ class PI05Policy(PreTrainedPolicy):
             self._action_queue.extend(actions.transpose(0, 1))
 
         action = self._action_queue.popleft()
+        self._sim_step += 1
         self._action_log_write_step(batch, action)
         return action
 
@@ -1490,14 +1543,28 @@ class PI05Policy(PreTrainedPolicy):
         tokens, masks = batch[f"{OBS_LANGUAGE_TOKENS}"], batch[f"{OBS_LANGUAGE_ATTENTION_MASK}"]
 
         # Sample actions using the model (pass through RTC kwargs, no separate state needed for PI05)
-        actions = self.model.sample_actions(images, img_masks, tokens, masks, **kwargs)
+        # Pre-sample initial noise outside the compiled region so we can log it without graph breaks.
+        bsize = tokens.shape[0]
+        _noise_shape = (bsize, self.config.chunk_size, self.config.max_action_dim)
+        _initial_noise = self.model.sample_noise(_noise_shape, tokens.device)
+        # logging.debug(
+        #     "[initial_noise] chunk=%d sum=%.6f norm=%.6f",
+        #     self._action_robustness_chunk_counter,
+        #     _initial_noise.sum().item(),
+        #     _initial_noise.norm().item(),
+        # )
+        # print(f"[initial_noise] chunk={self._action_robustness_chunk_counter} sum={_initial_noise.sum():.6f} norm={_initial_noise.norm():.6f}", flush=True)
+
+        actions = self.model.sample_actions(images, img_masks, tokens, masks, noise=_initial_noise, **kwargs)
 
         # Unpad actions to actual action dimension
         original_action_dim = self.config.output_features[ACTION].shape[0]
         actions = actions[:, :, :original_action_dim]
         raw_actions = actions
         actions = self._apply_action_robustness_noise(
-            actions, chunk_index=self._action_robustness_chunk_counter
+            actions,
+            chunk_index=self._action_robustness_chunk_counter,
+            chunk_sim_start=self._sim_step,
         )
         self._action_log_chunk_buf = (
             raw_actions[:, : self.config.n_action_steps].detach().cpu(),
